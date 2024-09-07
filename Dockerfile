@@ -16,9 +16,10 @@ FROM alpine:latest
 
 RUN apk add --no-cache libstdc++
 
-WORKDIR /root/
+WORKDIR /app
 COPY --from=builder /app/main .
-RUN mkdir -p ./cache
+RUN mkdir -p /app/cache
 
 EXPOSE 8080
+VOLUME /app/cache
 CMD ["./main", "-server"]
