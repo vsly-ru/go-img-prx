@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"crypto/md5"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/chai2010/webp"
 	"github.com/disintegration/imaging"
@@ -22,6 +24,18 @@ const (
 	cacheDir = "./cache"
 	port     = 8080
 )
+
+var (
+	imageCache     = make(map[string]*list.Element)
+	imageCacheList = list.New()
+	imageCacheMu   sync.Mutex
+	maxCacheSize   = 10
+)
+
+type CachedImage struct {
+	URL  string
+	Data image.Image
+}
 
 func init() {
 	image.RegisterFormat("webp", "RIFF????WEBPVP8", webp.Decode, webp.DecodeConfig)
@@ -117,23 +131,70 @@ func resizeAndSaveImage(imageURL, format string, width, height int) error {
 	cachedPath := filepath.Join(cacheDir, cacheKey)
 
 	if _, err := os.Stat(cachedPath); err == nil {
-		// Image already cached
-		log.Printf("Cache hit \033[32m%s\033[0m\n", cacheKey)
+		// Image already cached on disk
+		log.Printf("Disk cache hit \033[32m%s\033[0m\n", cacheKey)
 		return nil
 	}
 
-	// Download image
-	log.Printf("Downloading \033[33m%s\033[0m\n", imageURL)
-	resp, err := http.Get(imageURL)
-	if err != nil {
-		return fmt.Errorf("failed to download image: %v", err)
-	}
-	defer resp.Body.Close()
+	var img image.Image
+	var err error
 
-	// Decode image
-	img, err := imaging.Decode(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to decode image: %v", err)
+	// Check in-memory cache
+	imageCacheMu.Lock()
+	if elem, exists := imageCache[imageURL]; exists {
+		imageCacheList.MoveToFront(elem)
+		img = elem.Value.(*CachedImage).Data
+		log.Printf("Memory original image cache hit \033[34m%s\033[0m\n", imageURL)
+	}
+	imageCacheMu.Unlock()
+
+	if img == nil {
+		// Download image
+		log.Printf("Downloading \033[33m%s\033[0m\n", imageURL)
+		resp, err := http.Get(imageURL)
+		if err != nil {
+			return fmt.Errorf("failed to download image: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// Decode image
+		img, err = imaging.Decode(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to decode downloaded image: %v", err)
+		}
+
+		// Add to in-memory cache
+		imageCacheMu.Lock()
+		if imageCacheList.Len() >= maxCacheSize {
+			oldest := imageCacheList.Back()
+			if oldest != nil {
+				delete(imageCache, oldest.Value.(*CachedImage).URL)
+				imageCacheList.Remove(oldest)
+			}
+		}
+		elem := imageCacheList.PushFront(&CachedImage{URL: imageURL, Data: img})
+		imageCache[imageURL] = elem
+		imageCacheMu.Unlock()
+	}
+
+	// Get original dimensions
+	origWidth := img.Bounds().Dx()
+	origHeight := img.Bounds().Dy()
+
+	// Adjust dimensions if requested size is larger than original
+	if width > origWidth || height > origHeight {
+		rw := width
+		rh := height
+		requestedAspectRatio := float64(width) / float64(height)
+		// origAspectRatio := float64(origWidth) / float64(origHeight)
+		if width > origWidth {
+			width = origWidth
+			height = int(float64(width) / requestedAspectRatio)
+		} else {
+			height = origHeight
+			// width = int(float64(height) * origAspectRatio)
+		}
+		log.Printf("Adjusted dimensions %dx%d > %dx%d (requested size: %dx%d)\n", origWidth, origHeight, width, height, rw, rh)
 	}
 
 	// Resize image
